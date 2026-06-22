@@ -1,0 +1,12 @@
+# Build artifacts
+bin/
+build/
+*.o
+*.out
+
+# Database scratch files created at runtime
+*.db
+*.db.catalog
+*.db.wal
+minidb_lsm_*/
+demo.db*
