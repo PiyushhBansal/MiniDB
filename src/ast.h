@@ -23,7 +23,7 @@ struct CreateStmt {
     string table;
     Schema schema;
     string pk_column;  // empty if none
-    bool use_lsm = false;
+    bool use_mvcc = false;
 };
 
 struct InsertStmt {

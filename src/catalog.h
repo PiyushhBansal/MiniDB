@@ -14,8 +14,9 @@ using namespace std;
 
 namespace minidb {
 
-// HEAP = heap file + B+ tree (default). LSM = the log-structured engine.
-enum class StorageKind { HEAP, LSM };
+// HEAP = heap file + B+ tree, locked reads (default).
+// MVCC = same heap storage but versioned rows + snapshot reads (extension track B).
+enum class StorageKind { HEAP, MVCC };
 
 struct TableInfo {
     string name;
@@ -69,7 +70,7 @@ private:
                   << (t.schema.columns[i].type == Type::INT ? "INT" : "VARCHAR");
             }
             // storage goes last so older catalogs without it still load
-            f << '|' << (t.storage == StorageKind::LSM ? "LSM" : "HEAP");
+            f << '|' << (t.storage == StorageKind::MVCC ? "MVCC" : "HEAP");
             f << '\n';
         }
     }
@@ -96,7 +97,7 @@ private:
                 c.type = (kv[1] == "INT") ? Type::INT : Type::VARCHAR;
                 t.schema.columns.push_back(c);
             }
-            if (parts.size() >= 8 && parts[7] == "LSM") t.storage = StorageKind::LSM;
+            if (parts.size() >= 8 && parts[7] == "MVCC") t.storage = StorageKind::MVCC;
             tables_[t.name] = t;
         }
     }

@@ -4,8 +4,8 @@
 #   cmake -S . -B build && cmake --build build
 # Produces, in build/:
 #   minidb         — the interactive SQL shell
-#   bench          — the LSM vs B+ tree storage benchmark
-#   test_storage / test_btree / test_lsm / test_locking — component tests
+#   bench          — the MVCC vs 2PL contention benchmark
+#   test_storage / test_btree / test_mvcc / test_locking — component tests
 cmake_minimum_required(VERSION 3.16)
 project(MiniDB CXX)
 
@@ -25,15 +25,16 @@ add_executable(minidb src/main.cpp)
 target_link_libraries(minidb PRIVATE Threads::Threads)
 
 add_executable(bench benchmarks/bench.cpp)
+target_link_libraries(bench PRIVATE Threads::Threads)
 
 add_executable(test_storage src/test_storage.cpp)
 add_executable(test_btree   src/test_btree.cpp)
-add_executable(test_lsm     src/test_lsm.cpp)
+add_executable(test_mvcc    src/test_mvcc.cpp)
 add_executable(test_locking src/test_locking.cpp)
 target_link_libraries(test_locking PRIVATE Threads::Threads)
 
 enable_testing()
 add_test(NAME storage COMMAND test_storage)
 add_test(NAME btree   COMMAND test_btree)
-add_test(NAME lsm     COMMAND test_lsm)
+add_test(NAME mvcc    COMMAND test_mvcc)
 add_test(NAME locking COMMAND test_locking)

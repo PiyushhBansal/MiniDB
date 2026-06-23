@@ -119,10 +119,10 @@ private:
             break;
         }
         expect_punct(")");
-        // optional USING LSM | USING HEAP
+        // optional USING MVCC | USING HEAP
         if (accept_kw("USING")) {
             string eng = upper(next().text);
-            st.create.use_lsm = (eng == "LSM");
+            st.create.use_mvcc = (eng == "MVCC");
         }
         return st;
     }

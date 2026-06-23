@@ -30,12 +30,14 @@ SELECT id, name FROM emp;          -- erin gone after rollback
 DELETE FROM emp WHERE id = 4;
 SELECT id, name FROM emp;
 
--- ---- Extension Track C: LSM-tree storage ----
-CREATE TABLE kv (k INT, v VARCHAR, PRIMARY KEY (k)) USING LSM;
-INSERT INTO kv VALUES (5,'five'), (2,'two'), (9,'nine'), (1,'one');
-INSERT INTO kv VALUES (2, 'TWO-updated');   -- newest-wins
-DELETE FROM kv WHERE k = 1;                  -- tombstone
-SELECT * FROM kv;                            -- sorted, updated, key 1 gone
-EXPLAIN SELECT * FROM kv;                    -- LSM merged scan
+-- ---- Extension Track B: MVCC ----
+-- an MVCC table stores a version header (xmin/xmax) per row. readers use a
+-- snapshot and never take locks; a deleted row is just stamped, not removed.
+CREATE TABLE acct (id INT, name VARCHAR, bal INT, PRIMARY KEY (id)) USING MVCC;
+INSERT INTO acct VALUES (1,'alice',100), (2,'bob',200), (3,'carol',300);
+SELECT * FROM acct;
+DELETE FROM acct WHERE id = 2;               -- stamps xmax, old snapshots still saw it
+SELECT * FROM acct;                          -- bob no longer visible
+EXPLAIN SELECT * FROM acct;                  -- MVCC scan (snapshot N)
 
 \q

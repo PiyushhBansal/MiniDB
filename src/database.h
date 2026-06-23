@@ -13,7 +13,7 @@
 #include "wal.h"
 #include "recovery.h"
 #include "lock_manager.h"
-#include "lsm_tree.h"
+#include "mvcc.h"
 #include <iostream>
 #include <sstream>
 #include <map>
@@ -21,15 +21,6 @@
 using namespace std;
 
 namespace minidb {
-
-// turn an int64 PK into a sortable 8-byte key for the LSM. flip sign bit so
-// negatives sort first, then big-endian so byte order matches numeric order.
-inline string lsm_key(int64_t v) {
-    uint64_t u = (uint64_t)v ^ 0x8000000000000000ULL;
-    string k(8, '\0');
-    for (int b = 0; b < 8; ++b) k[b] = char((u >> (8 * (7 - b))) & 0xFF);
-    return k;
-}
 
 struct ResultSet {
     vector<string> columns;
@@ -61,6 +52,7 @@ public:
     TxnId begin_txn() {
         TxnId t = ++txn_counter_;
         wal_.append(t, LogType::BEGIN);
+        mvcc_.begin(t);            // mark active + take a snapshot for mvcc tables
         return t;
     }
     void commit_txn(TxnId t) {
@@ -69,13 +61,13 @@ public:
         // durability comes from the wal: even if dirty pages are still in the buffer
         // pool at crash, redo replays them from the log. one sequential log flush
         // instead of random page writes. pages get written lazily later.
+        mvcc_.commit(t);           // mvcc: now this txn's versions become visible to others
         lock_mgr_.release_all(t);  // strict 2PL: release only now, at commit
     }
 
     // clean shutdown calls this, crash skips it so recovery rebuilds from the wal.
     void checkpoint() {
         pool_.flush_all();
-        for (auto& [name, store] : lsm_) store->flush_memtable();
         wal_.checkpoint();
     }
     void abort_txn(TxnId t) {
@@ -88,10 +80,12 @@ public:
             if (it->txn != t) continue;
             if (it->type == LogType::INSERT) undo_insert(*it);
             else if (it->type == LogType::DELETE) undo_delete(*it);
+            else if (it->type == LogType::UPDATE) undo_update(*it);
         }
         wal_.append(t, LogType::ABORT);
         wal_.flush();
         pool_.flush_all();
+        mvcc_.abort(t);            // mvcc: aborted txn's versions stay invisible
         lock_mgr_.release_all(t);
     }
 
@@ -160,32 +154,16 @@ private:
         t.schema = c.schema;
         t.pk_col = c.pk_column.empty() ? -1 : c.schema.index_of(c.pk_column);
         t.row_count = 0;
-        if (c.use_lsm) {
-            t.storage = StorageKind::LSM;
-            lsm_store(t);  // makes the on-disk lsm dir + handle
-        } else {
-            t.storage = StorageKind::HEAP;
-            t.heap_root = HeapFile::create(&pool_);
-            if (t.pk_col >= 0) t.index_root = BPlusTree::create(&pool_);
-        }
+        t.storage = c.use_mvcc ? StorageKind::MVCC : StorageKind::HEAP;
+        // both heap and mvcc use the same heap-file storage. mvcc just stores a
+        // version header (xmin/xmax) in front of each tuple and skips read locks.
+        t.heap_root = HeapFile::create(&pool_);
+        if (t.pk_col >= 0) t.index_root = BPlusTree::create(&pool_);
         catalog_.put(t);
         pool_.flush_all();
         ResultSet rs; rs.message = "table '" + c.table + "' created" +
-                                   (c.use_lsm ? " (LSM storage)" : "");
+                                   (c.use_mvcc ? " (MVCC)" : "");
         return rs;
-    }
-
-    // get the lsm handle, create it on first use
-    LSMTree* lsm_store(const TableInfo& t) {
-        auto it = lsm_.find(t.name);
-        if (it != lsm_.end()) return it->second.get();
-        string dir = "minidb_lsm_" + t.name;
-        string mk = "mkdir -p '" + dir + "'";
-        system(mk.c_str());
-        auto store = make_unique<LSMTree>(dir);
-        LSMTree* ptr = store.get();
-        lsm_[t.name] = move(store);
-        return ptr;
     }
 
     // write row to heap, add to pk index, log it. note the ordering: wal record
@@ -195,30 +173,16 @@ private:
         TableInfo* t = catalog_.get(ins.table);
         if (!t) throw DBError("no such table: " + ins.table);
 
-        // lsm tables go their own way: just put the tuple keyed by pk. lsm has
-        // its own wal so we don't double-log here.
-        if (t->storage == StorageKind::LSM) {
-            if (t->pk_col < 0) throw DBError("LSM tables require a PRIMARY KEY");
-            LSMTree* lsm = lsm_store(*t);
-            int64_t n = 0;
-            for (const auto& row : ins.rows) {
-                if (row.size() != t->schema.size())
-                    throw DBError("column count mismatch on INSERT");
-                lsm->put(lsm_key(row[t->pk_col].i), serialize_tuple(row, t->schema));
-                t->row_count++; n++;
-            }
-            catalog_.update(*t);
-            ResultSet rs; rs.affected = n; rs.message = to_string(n) + " row(s) inserted";
-            return rs;
-        }
-
         auto scope = txn_scope();
         HeapFile hf(&pool_, t->heap_root);
+        bool mvcc = t->storage == StorageKind::MVCC;
         int64_t n = 0;
         for (const auto& row : ins.rows) {
             if (row.size() != t->schema.size())
                 throw DBError("column count mismatch on INSERT");
-            string image = serialize_tuple(row, t->schema);
+            // mvcc: stamp xmin = this txn, xmax = 0 (live). heap: plain bytes.
+            string image = mvcc ? serialize_versioned(row, t->schema, scope.txn, 0)
+                                : serialize_tuple(row, t->schema);
             RecordId rid = hf.insert(image);
             lock_mgr_.acquire(scope.txn, ResourceId{rid.page_id, rid.slot}, LockMode::EXCLUSIVE);
             wal_.append(scope.txn, LogType::INSERT, t->name, rid.page_id, rid.slot, "", image);
@@ -257,10 +221,13 @@ private:
         // optimizer picks index vs seq scan for the driving table
         AccessPath ap = choose_access_path(*t, left_preds);
         unique_ptr<Operator> driver;
-        if (t->storage == StorageKind::LSM) {
-            // lsm just has one merged scan, no secondary index to choose
-            driver = make_unique<LsmScan>(lsm_store(*t), t->schema);
-            if (explain_out) *explain_out += "  " + s.table + ": LSM merged scan\n";
+        if (t->storage == StorageKind::MVCC) {
+            // mvcc: scan the heap but only show versions visible to our snapshot.
+            // no read lock taken, so readers never block writers.
+            Snapshot snap = current_snapshot();
+            driver = make_unique<MvccScan>(&pool_, *t, &mvcc_, snap);
+            if (explain_out) *explain_out += "  " + s.table + ": MVCC scan (snapshot " +
+                                             to_string(snap.xid) + ")\n";
         } else if (ap.use_index) {
             driver = make_unique<IndexScan>(&pool_, *t, ap.key_lo, ap.key_hi);
             if (explain_out) *explain_out += "  " + s.table + ": " + ap.reason + "\n";
@@ -358,22 +325,30 @@ private:
         TableInfo* t = catalog_.get(d.table);
         if (!t) throw DBError("no such table: " + d.table);
 
-        // lsm: scan for matches, tombstone each matched pk
-        if (t->storage == StorageKind::LSM) {
-            LSMTree* lsm = lsm_store(*t);
-            vector<int64_t> kill;
-            lsm->scan([&](const string&, const string& rec) {
-                Tuple tup = deserialize_tuple(rec.data(), rec.size(), t->schema);
-                Row row{tup, {}};
-                bool match = true;
-                for (auto& p : d.where) if (!eval_pred(p, row, t->schema)) { match = false; break; }
-                if (match) kill.push_back(tup[t->pk_col].i);
+        // mvcc delete: don't remove the row, just stamp xmax = this txn on the
+        // visible version. old readers with an earlier snapshot still see it.
+        if (t->storage == StorageKind::MVCC) {
+            auto scope = txn_scope();
+            Snapshot snap = mvcc_.snapshot_for(scope.txn);
+            HeapFile hf(&pool_, t->heap_root);
+            int64_t n = 0;
+            hf.scan([&](RecordId rid, const string& rec) {
+                VersionHeader vh = read_version_header(rec.data());
+                if (!mvcc_.visible(vh, snap)) return true;     // not our version, skip
+                Tuple tup = deserialize_tuple(rec.data() + VHDR_SIZE, rec.size() - VHDR_SIZE, t->schema);
+                Row row{tup, rid};
+                for (auto& p : d.where) if (!eval_pred(p, row, t->schema)) return true;
+                // stamp xmax in place (same length, just overwrite the 8 bytes)
+                lock_mgr_.acquire(scope.txn, ResourceId{rid.page_id, rid.slot}, LockMode::EXCLUSIVE);
+                string before = rec;
+                string after = rec; set_xmax(after, scope.txn);
+                wal_.append(scope.txn, LogType::UPDATE, t->name, rid.page_id, rid.slot, before, after);
+                write_version_inplace(rid, after);
+                t->row_count--; n++;
                 return true;
             });
-            for (int64_t k : kill) { lsm->remove(lsm_key(k)); t->row_count--; }
             catalog_.update(*t);
-            ResultSet rs; rs.affected = (int64_t)kill.size();
-            rs.message = to_string(kill.size()) + " row(s) deleted";
+            ResultSet rs; rs.affected = n; rs.message = to_string(n) + " row(s) deleted";
             return rs;
         }
 
@@ -430,16 +405,44 @@ private:
         }
         pool_.unpin_page(r.page, true);
     }
+    // mvcc delete logs an UPDATE (xmax change). undo = put the before-image back.
+    void undo_update(const LogRecord& r) {
+        Page* p = pool_.fetch_page(r.page);
+        HeapPage hp(p);
+        if (r.slot < hp.header()->num_slots) {
+            Slot& s = hp.slots()[r.slot];
+            if (s.length > 0 && r.before.size() == (size_t)s.length)
+                memcpy(p->data + s.offset, r.before.data(), r.before.size());
+        }
+        pool_.unpin_page(r.page, true);
+    }
+
+    // overwrite a slot's bytes in place (mvcc xmax stamp - same length so safe).
+    void write_version_inplace(RecordId rid, const string& image) {
+        Page* p = pool_.fetch_page(rid.page_id);
+        HeapPage hp(p);
+        Slot& s = hp.slots()[rid.slot];
+        if ((size_t)s.length == image.size())
+            memcpy(p->data + s.offset, image.data(), image.size());
+        pool_.unpin_page(rid.page_id, true);
+    }
+
+    // snapshot for the current statement. inside a BEGIN block we reuse the txn's
+    // snapshot; an autocommit SELECT gets a fresh one-shot snapshot.
+    Snapshot current_snapshot() {
+        if (explicit_txn_) return mvcc_.snapshot_for(explicit_txn_);
+        return mvcc_.fresh_readonly_snapshot();
+    }
 
     DiskManager disk_;
     BufferPool pool_;
     Catalog catalog_;
     WAL wal_;
     LockManager lock_mgr_;
+    MvccManager mvcc_;
     TxnId txn_counter_ = 0;
     TxnId explicit_txn_ = 0;   // 0 = autocommit
     Recovery::Report last_recovery_;
-    map<string, unique_ptr<LSMTree>> lsm_;  // one store per lsm table
 };
 
 }  // namespace minidb

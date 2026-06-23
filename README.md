@@ -5,7 +5,8 @@
 > buffer pool, a B+ tree index, a SQL parser and Volcano-model executor, a
 > cost-based optimizer, serializable transactions via strict two-phase locking,
 > write-ahead logging with crash recovery, and — as the chosen extension —
-> an **LSM-tree** alternative storage engine.
+> opt-in **MVCC** (multi-version concurrency control) so readers never block on
+> writers.
 
 ---
 
@@ -16,7 +17,7 @@
 | _<member 1>_ | _SCALERxxxxx_ | _xxx@scaler.com_ |
 | _<member 2>_ | _SCALERxxxxx_ | _xxx@scaler.com_ |
 
-> **Team name:** `Team_MiniDB` &nbsp;•&nbsp; **Extension track:** **C — Modern Storage (LSM-tree)**
+> **Team name:** `Team_MiniDB` &nbsp;•&nbsp; **Extension track:** **B — Concurrency (MVCC)**
 > _(Fill in the member details above before submitting the PR.)_
 
 ---
@@ -35,12 +36,15 @@ database internals rather than a thin wrapper over existing tooling.
 - A **cost-based optimizer** that chooses index vs sequential scan and join order.
 - **Serializable** transactions with strict **2PL** and deadlock detection.
 - **WAL** + **crash recovery** that preserves committed transactions.
-- **Extension Track C:** an **LSM-tree** storage engine, benchmarked against the B+ tree.
+- **Extension Track B:** opt-in **MVCC**, benchmarked against plain 2PL under contention.
 
-**Chosen extension track:** **C — Modern Storage.** We added a log-structured
-merge-tree engine (MemTable + SSTables + compaction) selectable per table with
-`CREATE TABLE ... USING LSM`, and benchmarked it against the default B+ tree /
-heap-file storage. See [§9](#9-extension-track-c--lsm-tree) and
+**Chosen extension track:** **B — Concurrency (MVCC).** We keep strict 2PL +
+deadlock detection as the required core, and add MVCC as an opt-in mode per table
+with `CREATE TABLE ... USING MVCC`. MVCC tables reuse the same heap-file storage
+but prepend a 16-byte version header (`xmin`/`xmax`) to every tuple; each
+transaction takes a snapshot at begin, and reads emit only the versions visible
+to that snapshot — so readers take no locks and never block writers. See
+[§9](#9-extension-track-b--mvcc-concurrency) and
 [`benchmarks/REPORT.md`](benchmarks/REPORT.md).
 
 ---
@@ -66,16 +70,16 @@ heap-file storage. See [§9](#9-extension-track-c--lsm-tree) and
         │            ┌──────────▼──┐   ┌────────▼─────────┐
         │  optimizer │  Optimizer  │   │   Executor       │   executor.h
         │ (cost model│ access path │   │ Volcano operators│  SeqScan/IndexScan/
-        │  selectvty)│ join order  │   │ Filter/HashJoin/ │  LsmScan/Filter
+        │  selectvty)│ join order  │   │ Filter/HashJoin/ │  MvccScan/Filter
         │            └─────────────┘   │ scan/join/filter │
         │   ┌──────────────┐  ┌────────────▼───┐ ┌───▼──────────────┐
-        │   │ LockManager  │  │   B+ Tree      │ │   LSM-tree       │  bplus_tree.h
-        │   │ strict 2PL   │  │   (PK index)   │ │ MemTable+SSTable │  lsm_tree.h
-        │   │ deadlock det │  └───────┬────────┘ │ + compaction     │
+        │   │ LockManager  │  │   B+ Tree      │ │   MvccManager    │  bplus_tree.h
+        │   │ strict 2PL   │  │   (PK index)   │ │ version headers  │  mvcc.h
+        │   │ deadlock det │  └───────┬────────┘ │ snapshot visibty │
         │   └──────────────┘          │          └───────┬──────────┘
-        │   ┌──────────────┐  ┌───────▼────────┐         │ (own files)
-        └──►│  WAL + Recov │  │   Heap File    │         │
-            │ redo/undo    │  │ slotted pages  │  heap_file.h
+        │   ┌──────────────┐  ┌───────▼────────┐         │ visibility check
+        └──►│  WAL + Recov │  │   Heap File    │◄────────┘ (MVCC tables
+            │ redo/undo    │  │ slotted pages  │  heap_file.h  reuse heap)
             └──────┬───────┘  └───────┬────────┘
                    │                  │
             ┌──────▼──────────────────▼────────┐
@@ -106,14 +110,15 @@ heap-file storage. See [§9](#9-extension-track-c--lsm-tree) and
 | `lock_manager.h` | strict 2PL, S/X locks, wait-for-graph deadlock detection |
 | `wal.h` | write-ahead log records + base64 image encoding |
 | `recovery.h` | ARIES-style analysis / redo / undo |
-| `lsm_tree.h` | **Track C** — MemTable, SSTable, size-tiered compaction |
+| `mvcc.h` | **Track B** — `MvccManager`: txn states, snapshots, version visibility |
 | `database.h` | the glue: planning, DDL/DML, transactions, recovery |
 
 **Data flow for a query.** SQL text → `Parser` → `Statement` → `Database`
 builds an operator tree (consulting the `Optimizer`) → operators pull tuples
-from `HeapFile`/`BPlusTree`/`LSMTree` through the `BufferPool` → results
-materialized and printed. Writes additionally go through the `LockManager`
-(2PL) and `WAL` (durability).
+from `HeapFile`/`BPlusTree` through the `BufferPool` → results materialized and
+printed. On MVCC tables the `MvccScan` operator filters versions through the
+`MvccManager`'s snapshot-visibility check. Writes additionally go through the
+`LockManager` (2PL) and `WAL` (durability).
 
 ---
 
@@ -178,7 +183,7 @@ index scan (see §6).
 produces a `Statement` AST (`ast.h`). Supported grammar:
 
 ```
-CREATE TABLE t (col TYPE, …, PRIMARY KEY (col)) [USING LSM|HEAP];
+CREATE TABLE t (col TYPE, …, PRIMARY KEY (col)) [USING MVCC|HEAP];
 INSERT INTO t VALUES (…), (…);
 SELECT a, b | *
        FROM t [JOIN u ON t.x = u.y]
@@ -199,7 +204,7 @@ access path and the join order.
 |----------|---------|
 | `SeqScan` | full heap-file scan |
 | `IndexScan` | B+ tree range probe → heap fetch (chosen by optimizer) |
-| `LsmScan` | merged ordered scan over an LSM table |
+| `MvccScan` | scan the heap, emit only versions visible to the snapshot (no read locks) |
 | `Filter` | apply ANDed `WHERE` predicates |
 | `HashJoin` | inner equi-join; builds a hash table on the smaller side |
 
@@ -250,7 +255,8 @@ A System-R-style **cost-based** optimizer (`optimizer.h`):
   ROLLBACK` groups multiple statements into one transaction.
 
 `make test` exercises S/S compatibility, X blocking, and a real two-transaction
-deadlock (`src/test_locking.cpp`).
+deadlock (`src/test_locking.cpp`), plus the six snapshot-visibility properties of
+the MVCC mode (`src/test_mvcc.cpp` — see [§9](#9-extension-track-b--mvcc-concurrency)).
 
 ---
 
@@ -292,49 +298,66 @@ SELECT * FROM t;   -- shows 1 (and 2), NOT 99
 
 ---
 
-## 9. Extension Track C — LSM-tree
+## 9. Extension Track B — MVCC (Concurrency)
 
-**Motivation.** Heap-file + B+ tree storage updates data in place (random I/O),
-which caps write throughput. An LSM-tree is the design behind LevelDB / RocksDB /
-Cassandra: buffer writes in memory, flush them as immutable sorted runs, and
-merge runs in the background — trading some read work for far higher write rates.
+**Motivation.** Under plain strict 2PL, a reader takes an S-lock on every row it
+touches, so the moment a writer holds an X-lock the reader has to wait — readers
+block on writers and vice-versa. MVCC fixes this for reads: instead of locking,
+each transaction reads from a consistent **snapshot** of the database, so readers
+see a stable view and never block, while writers still serialize among themselves.
 
-**Design** (`lsm_tree.h`):
-- **MemTable** — an in-memory sorted map of the newest writes; reads check it first.
-- **SSTable** — when the MemTable fills, it is flushed to an immutable, sorted
-  on-disk file with an in-memory key→offset index.
-- **Compaction** — size-tiered: when too many SSTables accumulate they are
-  k-way merged into one, newest-wins, dropping overwritten keys and tombstones.
-- **Deletes** are **tombstones** that shadow older values until compaction
-  removes them.
+**Design** (`mvcc.h`, `tuple.h`):
+- **Version header.** MVCC tables reuse the normal heap-file storage, but every
+  stored tuple is prefixed with a 16-byte header:
+  `[xmin (8B)][xmax (8B)][column bytes…]`. `xmin` is the txn that created the
+  version; `xmax` is the txn that deleted it (`0` = still live). See
+  `VersionHeader` / `serialize_versioned` / `read_version_header` / `set_xmax` /
+  `VHDR_SIZE` in `tuple.h`.
+- **MvccManager** tracks each transaction's state (ACTIVE / COMMITTED / ABORTED),
+  and at `begin()` takes a **Snapshot**: the set of txns active at that moment
+  plus a `next` boundary id. Commit/abort notify the manager.
+- **Visibility rule** — `visible(VersionHeader, Snapshot)`: a version is visible
+  iff its `xmin` is committed-in-our-view (our own txn, OR committed AND
+  `id < snapshot.next` AND not in the snapshot's active set) AND its `xmax` is
+  *not* committed-in-our-view (i.e. as far as we can see it has not been deleted).
+- **INSERT** on an MVCC table (`exec_insert` in `database.h`) writes a versioned
+  tuple with `xmin = current txn`, `xmax = 0`.
+- **DELETE** (`exec_delete`) does **not** remove the row; it stamps
+  `xmax = current txn` on the visible version in place and logs it as a WAL
+  `UPDATE`. Older snapshots still see the row.
+- **MvccScan** (`executor.h`) scans the heap, reads each version header, and emits
+  only the rows visible to the current snapshot — taking **no read locks**, which
+  is why readers don't block writers. `EXPLAIN` prints `MVCC scan (snapshot N)`.
+- **Locks.** Readers take no locks; writers still take X-locks for write-write
+  protection.
 
-**Integration.** A table created `USING LSM` stores its tuples (PK → serialized
-tuple) in an `LSMTree` instead of a heap file; `INSERT`/`DELETE`/`SELECT` route
-through it transparently, and `EXPLAIN` reports an *LSM merged scan*.
-
-**Results** (full analysis in [`benchmarks/REPORT.md`](benchmarks/REPORT.md)):
+**Results** (full analysis in [`benchmarks/REPORT.md`](benchmarks/REPORT.md);
+`benchmarks/bench.cpp` runs MVCC lock-free reads vs 2PL S-lock reads under a
+concurrent writer):
 
 | Metric | Outcome |
 |--------|---------|
-| Write throughput | **LSM 9–30× faster** than B+ tree (steady state) |
-| Read latency | **B+ tree 3–5× faster** (LSM read amplification) |
-| Storage | **LSM ~0.76×** the B+ tree's footprint |
+| Read throughput under contention | **MVCC ~8–100× faster** than 2PL |
+| Reader blocking | **MVCC readers never block** on the writer; 2PL readers stall on X-locks |
+| Cost | **+16 bytes/row** version header, and no version GC (old/deleted versions accumulate) |
 
-This is exactly the canonical LSM trade-off, confirming the implementation.
+This is the canonical MVCC trade-off: lock-free, snapshot-consistent reads in
+exchange for per-row version overhead.
 
 ---
 
 ## 10. Benchmarks
 
-- **Setup:** Apple Silicon, clang `-O2`; identical `(key → value)` workload at
-  10K–200K rows and 32 B / 256 B values; up to 50K random point lookups.
+- **Setup:** Apple Silicon, clang `-O2`; concurrent point-read workload while a
+  background writer mutates the table — MVCC (lock-free snapshot reads) vs 2PL
+  (S-lock reads) measuring read throughput and reader stalls.
 - **Code & raw data:** [`benchmarks/bench.cpp`](benchmarks/bench.cpp),
   [`benchmarks/results.txt`](benchmarks/results.txt).
 - **Full analysis:** [`benchmarks/REPORT.md`](benchmarks/REPORT.md).
 
 Reproduce:
 ```
-make bench          # or: ./bin/bench 256
+make bench          # MVCC vs 2PL under a concurrent writer
 ```
 
 ---
@@ -348,18 +371,20 @@ make bench          # or: ./bin/bench 256
   only (the spec lists a secondary index as optional).
 - **Catalog is a text sidecar** and is not WAL-protected (DDL is not crash-atomic);
   data DML *is* logged and recovered.
-- **LSM cross-session reload:** SSTables are written to disk, but on restart the
-  in-memory SSTable list is rebuilt only within a session; full reload-on-open is
-  a small, noted TODO.
-- **LSM has no Bloom filters / block cache yet** — adding them would close most
-  of the read-latency gap.
+- **MVCC has no version garbage collection / `VACUUM`:** deleted versions (those
+  with `xmax` set) and superseded versions are never reclaimed, so MVCC tables
+  grow monotonically over a session.
+- **MVCC snapshots are simple:** visibility is snapshot-isolation only — there is
+  no true serializable-snapshot-isolation read/write conflict detection beyond the
+  writers' X-locks.
+- **MVCC version header costs 16 bytes/row** on top of the tuple itself.
 - **Single-file, single-node**; no networking; numeric (`int64`) primary keys.
 - **B+ tree node (de)serialization** favors readability over raw speed (see
   `bplus_tree.h`); this lowers absolute B+ tree write throughput but not the
   qualitative benchmark conclusions.
 
-**Future improvements:** node merging on delete; secondary indexes; Bloom
-filters + leveled compaction for the LSM; group-commit; MVCC.
+**Future improvements:** node merging on delete; secondary indexes; version GC /
+`VACUUM` for MVCC tables; serializable-snapshot conflict detection; group-commit.
 
 ---
 
@@ -386,8 +411,8 @@ ctest --test-dir build      # run component tests
 
 **Run the tests / benchmark:**
 ```
-make test                   # storage, B+ tree, LSM, locking
-make bench                  # LSM vs B+ tree
+make test                   # storage, B+ tree, mvcc, locking
+make bench                  # MVCC vs 2PL
 ```
 
 **Example session:**
@@ -404,9 +429,10 @@ EXPLAIN SELECT * FROM emp WHERE id = 2;     -- show the chosen plan
 
 BEGIN; INSERT INTO emp VALUES (4,'dave',20); ROLLBACK;   -- rolled back
 
-CREATE TABLE kv (k INT, v VARCHAR, PRIMARY KEY (k)) USING LSM;  -- Track C
-INSERT INTO kv VALUES (5,'five'),(2,'two'),(9,'nine');
-SELECT * FROM kv;                            -- LSM scan returns keys in order: 2,5,9
+CREATE TABLE acct (id INT, name VARCHAR, bal INT, PRIMARY KEY (id)) USING MVCC;  -- Track B
+INSERT INTO acct VALUES (1,'alice',100),(2,'bob',200);
+DELETE FROM acct WHERE id = 2;   -- stamps xmax, doesn't physically remove
+SELECT * FROM acct;              -- bob no longer visible to new snapshots
 ```
 
 Shell meta-commands: `\tables`, `\checkpoint`, `\crash` (simulate power loss),

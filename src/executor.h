@@ -5,7 +5,7 @@
 #include "catalog.h"
 #include "heap_file.h"
 #include "bplus_tree.h"
-#include "lsm_tree.h"
+#include "mvcc.h"
 #include "ast.h"
 #include "optimizer.h"
 #include <memory>
@@ -76,17 +76,26 @@ struct SeqScan : Operator {
     }
 };
 
-// merged ordered scan when the table is backed by the LSM engine
-struct LsmScan : Operator {
-    LSMTree* lsm;
-    Schema schema;
+// mvcc scan: like SeqScan but each stored tuple has a version header, and we
+// only emit the ones visible to our snapshot. no locks taken on read.
+struct MvccScan : Operator {
+    BufferPool* bp;
+    TableInfo info;
+    MvccManager* mvcc;
+    Snapshot snap;
     vector<Row> buffered;
     size_t cursor = 0;
-    LsmScan(LSMTree* l, const Schema& s) : lsm(l), schema(s) { out_schema = s; }
+
+    MvccScan(BufferPool* bp_, const TableInfo& ti, MvccManager* m, const Snapshot& s)
+        : bp(bp_), info(ti), mvcc(m), snap(s) { out_schema = ti.schema; }
     void open() override {
-        lsm->scan([&](const string&, const string& rec) {
+        HeapFile hf(bp, info.heap_root);
+        hf.scan([&](RecordId rid, const string& rec) {
+            VersionHeader vh = read_version_header(rec.data());
+            if (!mvcc->visible(vh, snap)) return true;   // not in our snapshot, skip
             Row r;
-            r.values = deserialize_tuple(rec.data(), rec.size(), schema);
+            r.values = deserialize_tuple(rec.data() + VHDR_SIZE, rec.size() - VHDR_SIZE, info.schema);
+            r.rid = rid;
             buffered.push_back(move(r));
             return true;
         });

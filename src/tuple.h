@@ -97,4 +97,34 @@ inline Tuple deserialize_tuple(const char* data, size_t len, const Schema& schem
     return t;
 }
 
+// ---- MVCC version header ----
+// for mvcc tables we put a small header in front of each stored tuple:
+//   [ xmin (8 bytes) ][ xmax (8 bytes) ][ normal tuple bytes... ]
+// xmin = txn that created this version, xmax = txn that deleted it (0 = still live).
+struct VersionHeader {
+    TxnId xmin = 0;
+    TxnId xmax = 0;
+};
+constexpr size_t VHDR_SIZE = 16;   // two uint64
+
+inline string serialize_versioned(const Tuple& t, const Schema& schema, TxnId xmin, TxnId xmax) {
+    string out;
+    out.append(reinterpret_cast<const char*>(&xmin), sizeof(xmin));
+    out.append(reinterpret_cast<const char*>(&xmax), sizeof(xmax));
+    out += serialize_tuple(t, schema);   // header then the usual column bytes
+    return out;
+}
+
+inline VersionHeader read_version_header(const char* data) {
+    VersionHeader vh;
+    memcpy(&vh.xmin, data, sizeof(vh.xmin));
+    memcpy(&vh.xmax, data + sizeof(vh.xmin), sizeof(vh.xmax));
+    return vh;
+}
+
+// overwrite just the xmax field in an already-serialized versioned image
+inline void set_xmax(string& image, TxnId xmax) {
+    memcpy(&image[sizeof(TxnId)], &xmax, sizeof(xmax));
+}
+
 }  // namespace minidb

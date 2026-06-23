@@ -1,22 +1,10 @@
-MiniDB Storage Benchmark — LSM vs B+ tree (value ~32 bytes)
-rows       | write tput (ins/s)     | read latency (us)      | disk bytes        
-----------------------------------------------------------------------------------
-10000      | B+:      727 LSM: 127157 | B+:   6.47 LSM:  39.05 | B+:  806912 LSM:  610000
-           |  -> LSM 174.88x writes      |  -> B+ 6.03x faster reads |  -> LSM/B+ space 0.76x
-50000      | B+:     1203 LSM:  40416 | B+:   9.63 LSM:  37.51 | B+: 4022272 LSM: 3050000
-           |  -> LSM 33.59x writes      |  -> B+ 3.90x faster reads |  -> LSM/B+ space 0.76x
-100000     | B+:     1740 LSM:  30828 | B+:   5.94 LSM:  27.71 | B+: 8040448 LSM: 6100000
-           |  -> LSM 17.71x writes      |  -> B+ 4.67x faster reads |  -> LSM/B+ space 0.76x
-200000     | B+:     1916 LSM:  16253 | B+:   6.75 LSM:  27.88 | B+:16076800 LSM:12200000
-           |  -> LSM 8.48x writes      |  -> B+ 4.13x faster reads |  -> LSM/B+ space 0.76x
-MiniDB Storage Benchmark — LSM vs B+ tree (value ~256 bytes)
-rows       | write tput (ins/s)     | read latency (us)      | disk bytes        
-----------------------------------------------------------------------------------
-10000      | B+:      703 LSM: 150737 | B+:   4.47 LSM:  29.53 | B+: 3055616 LSM: 2860000
-           |  -> LSM 214.51x writes      |  -> B+ 6.61x faster reads |  -> LSM/B+ space 0.94x
-50000      | B+:      462 LSM:  41004 | B+:   7.61 LSM:  29.39 | B+:15265792 LSM:14300000
-           |  -> LSM 88.77x writes      |  -> B+ 3.86x faster reads |  -> LSM/B+ space 0.94x
-100000     | B+:      462 LSM:  26480 | B+:   6.87 LSM:  29.71 | B+:30527488 LSM:28600000
-           |  -> LSM 57.34x writes      |  -> B+ 4.33x faster reads |  -> LSM/B+ space 0.94x
-200000     | B+:      385 LSM:  15938 | B+: 771.46 LSM:  31.53 | B+:61054976 LSM:57200000
-           |  -> LSM 41.45x writes      |  -> B+ 0.04x faster reads |  -> LSM/B+ space 0.94x
+MVCC vs 2PL under read/write contention
+(reader does N passes over R rows while a writer holds X-locks on them)
+
+rows     | passes   | 2PL reads (ms) | MVCC reads(ms) | speedup
+----------------------------------------------------------------------
+50       | 200      | 2.48           | 0.12           | 20.5x
+100      | 200      | 3.19           | 0.18           | 17.7x
+200      | 200      | 28.65          | 0.27           | 106.8x
+
+MVCC readers never block (no S-locks), so reads stay fast under a busy writer.

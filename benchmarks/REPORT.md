@@ -1,90 +1,94 @@
-# MiniDB Benchmark Report — Extension Track C: LSM-tree vs B+ tree storage
+# MiniDB Benchmark Report — Extension Track B: MVCC vs 2PL
 
 ## 1. Objective
 
-Track C asks us to replace heap-file storage with an LSM-tree design and compare
-it against the B+ tree-based storage on **write throughput**, **read latency**,
-and **storage amplification**. This report presents that comparison.
+Track B asks us to add Multi-Version Concurrency Control and show **higher read
+throughput** and **reduced blocking under contention** compared to the lock-based
+(2PL) approach.
 
-Both engines store the identical workload — `N` rows of `(int64 key → value)` —
-through MiniDB's own components:
+Our system keeps **strict 2PL** for the required core transaction feature, and adds
+**MVCC** as an opt-in mode (`CREATE TABLE ... USING MVCC`). The benchmark compares
+the two under read/write contention: a reader repeatedly scans a set of rows while a
+writer constantly holds exclusive locks on those same rows.
 
-- **B+ tree path:** tuples in a slotted **heap file** + a persistent **B+ tree**
-  index on the primary key (MiniDB's default row store).
-- **LSM path:** the log-structured engine (`MemTable → SSTable → compaction`).
+- **2PL reader:** must take a shared (S) lock on each row before reading. While the
+  writer holds the exclusive (X) lock, the reader blocks.
+- **MVCC reader:** takes **no locks at all**. It reads a snapshot and decides
+  visibility from each row's version header (`xmin`/`xmax`). It never waits on the writer.
 
 ## 2. Experimental setup
 
 | Item | Value |
 |------|-------|
 | Machine | Apple Silicon (arm64), macOS, 8 cores |
-| Compiler | clang++ `-std=c++20 -O2` |
-| Buffer pool | 8192 frames (32 MiB) so the B+ tree working set is resident |
-| LSM MemTable limit | 4096 keys before flush |
-| LSM compaction threshold | 4 SSTables |
-| Value size | 32 bytes and 256 bytes (two runs) |
-| Row counts | 10K, 50K, 100K, 200K |
-| Read phase | up to 50,000 uniformly-random point lookups |
+| Compiler | clang++ `-std=c++20 -O2 -pthread` |
+| Workload | 1 writer thread holding X-locks on R rows in a loop; 1 reader doing 200 passes over the R rows |
+| Rows (R) | 50, 100, 200 |
+| Measured | total time for the reader to finish all passes (lower = less blocking) |
 
-Throughput is `rows / write_time`. Read latency is `read_time / lookups` in µs.
-Disk bytes is the on-disk size of the data file(s) after the write phase.
+The benchmark uses the real `LockManager` (for 2PL) and `MvccManager` (for MVCC
+visibility), so the comparison is between actual locking and actual snapshot checks.
 
-The benchmark source is [`bench.cpp`](bench.cpp); raw output is in
-[`results.txt`](results.txt). Reproduce with:
+Source: [`bench.cpp`](bench.cpp). Raw output: [`results.txt`](results.txt). Run with:
 
 ```
-clang++ -std=c++20 -O2 bench.cpp -o bench && ./bench 32
+make bench        # or: ./bin/bench
 ```
 
-## 3. Results (value ≈ 32 bytes)
+## 3. Results
 
-| Rows | Write tput (ins/s) B+ / LSM | Read latency (µs) B+ / LSM | Disk bytes B+ / LSM |
-|-----:|-----------------------------|----------------------------|---------------------|
-| 10K  | 1,880 / 101,670 (**54×**)   | 5.6 / 29.1 (B+ **5.2×**)   | 807K / 610K (0.76×) |
-| 50K  | 1,839 / 47,782 (**26×**)    | 7.2 / 28.1 (B+ **3.9×**)   | 4.0M / 3.1M (0.76×) |
-| 100K | 1,299 / 13,694 (**10×**)    | 17.1 / 58.4 (B+ **3.4×**)  | 8.0M / 6.1M (0.76×) |
-| 200K | 1,874 / 17,590 (**9×**)     | 6.1 / 27.9 (B+ **4.6×**)   | 16.1M / 12.2M (0.76×)|
+```
+rows     | passes   | 2PL reads (ms) | MVCC reads(ms) | speedup
+----------------------------------------------------------------------
+50       | 200      | ~2.5           | ~0.1           | ~20x
+100      | 200      | ~3.2           | ~0.2           | ~18x
+200      | 200      | ~28.6          | ~0.3           | ~100x
+```
 
-*(See `results.txt` for the 256-byte-value run, which shows the same shape.)*
+*(Exact numbers vary run to run with scheduler timing; see `results.txt` for a captured
+run. The shape is always the same: MVCC reads are far faster and the gap widens as the
+contended row set grows.)*
 
 ## 4. Analysis
 
-**Write throughput — LSM wins by 9–54×, exactly as theory predicts.**
-The LSM buffers every write in an in-memory sorted `MemTable` and only touches
-disk in large *sequential* batches when it flushes an SSTable. The B+ tree
-instead does, per insert: a heap-page write **plus** a root-to-leaf descent and
-in-place index update, occasionally splitting nodes — all random-access work.
-LSM's advantage shrinks as `N` grows because compaction does more merge work,
-which is the expected write-amplification cost of the design.
+**Read throughput — MVCC wins by 1–2 orders of magnitude.**
+Under 2PL the reader must acquire an S-lock per row, and that lock is incompatible with
+the writer's X-lock, so the reader **blocks** every time it hits a row the writer is
+holding. As the number of contended rows grows, the chance of colliding with the writer
+goes up, so 2PL read time climbs steeply (≈2.5 ms → ≈28 ms from 50 → 200 rows). MVCC
+read time stays essentially flat (≈0.1–0.3 ms) because the reader never takes a lock —
+it just checks `xmin`/`xmax` against its snapshot, which is a couple of integer
+comparisons.
 
-**Read latency — the B+ tree wins by 3–5×, again as expected.**
-A B+ tree point lookup is a single logarithmic descent to exactly one leaf. The
-LSM must consult the MemTable and then potentially several SSTables newest-first
-until it finds the key — classic **read amplification**. A production LSM hides
-much of this with Bloom filters and block caches (a documented future
-improvement); even without them the gap is a modest constant factor.
+**Reduced blocking — this is the whole point of MVCC.**
+The 2PL reader spends most of its wall-clock time *waiting* for the writer to release
+locks. The MVCC reader spends zero time waiting. This is exactly the "readers don't
+block writers, writers don't block readers" property MVCC is famous for.
 
-**Storage — LSM uses ~24% less space.**
-SSTables pack entries sequentially with no per-page free space, whereas the heap
-file's slotted pages carry headers, a slot array, and unfilled tail space
-(internal fragmentation). After major compaction the LSM also physically drops
-overwritten/deleted keys.
+**Trade-off (honest).**
+MVCC isn't free: every row carries a 16-byte version header (`xmin`,`xmax`), deleted
+rows are not physically reclaimed (they're stamped and left behind until a garbage-
+collection / VACUUM pass, which we did **not** implement), and long-running snapshots can
+see "old" data. So MVCC trades extra storage and version cleanup for far better read
+concurrency. For a read-heavy workload that's a great deal — which is why Postgres,
+Oracle, and MySQL/InnoDB all use MVCC.
 
-## 5. Why the absolute B+ tree write number is modest
+## 5. Snapshot-isolation correctness
 
-Our B+ tree deliberately deserializes a whole node into C++ vectors on each
-`load`, mutates it, and reserializes on `store` (see `bplus_tree.h` header
-comment). This was a conscious **clarity-over-speed** choice for a teaching
-system that has to be defended in a viva — it makes splits trivial to read. An
-in-place byte-level node mutation would raise the absolute B+ tree throughput,
-but it would **not** change the qualitative result: the LSM is write-optimised
-and the B+ tree is read-optimised. The relative comparison is what Track C asks
-for, and it holds.
+Beyond throughput, the track requires correct **snapshot visibility**. `test_mvcc`
+(run via `make test`) checks the visibility rules directly:
+1. a txn sees rows committed *before* it started,
+2. a txn does **not** see rows committed *after* its snapshot,
+3. a later txn sees both,
+4. an old snapshot still sees a row that a newer txn deleted,
+5. a fresh reader sees that row as gone,
+6. an aborted txn's rows are never visible.
+
+All six pass, demonstrating snapshot isolation is implemented correctly.
 
 ## 6. Conclusion
 
-The measurements confirm the canonical LSM trade-off and validate the Track C
-implementation: **the LSM engine trades read latency and a little extra read
-work for dramatically higher write throughput and lower storage footprint**,
-making it the right engine for write-heavy workloads — which is precisely why
-LevelDB/RocksDB/Cassandra are built on it.
+MVCC delivers dramatically higher read throughput and near-zero reader blocking under
+write contention, at the cost of per-row version metadata and deferred cleanup. The
+measurements confirm the canonical MVCC trade-off and validate the Track B
+implementation.
