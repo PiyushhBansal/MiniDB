@@ -31,13 +31,9 @@ struct InsertStmt {
     vector<Tuple> rows;
 };
 
-enum class AggFn { NONE, COUNT, SUM, MIN, MAX };
-
-// SELECT cols FROM t [JOIN t2 ON a=b] [WHERE ...] [ORDER BY col [DESC]]
+// SELECT cols FROM t [JOIN t2 ON a=b] [WHERE ...]
 struct SelectStmt {
     vector<string> columns;   // empty or {"*"} = all
-    AggFn agg = AggFn::NONE;
-    string agg_column;
 
     string table;                  // left table
     bool has_join = false;              // one inner join max
@@ -46,10 +42,6 @@ struct SelectStmt {
     string join_right_col;
 
     vector<Predicate> where;
-
-    bool has_order = false;
-    string order_column;
-    bool order_desc = false;
 };
 
 struct DeleteStmt {

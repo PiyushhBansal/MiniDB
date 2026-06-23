@@ -82,7 +82,7 @@ int main(int argc, char** argv) {
                              "  \\checkpoint   flush dirty pages + write a checkpoint\n"
                              "  \\crash        simulate a power failure (exit WITHOUT flushing pages)\n"
                              "  \\q            clean shutdown (checkpoints first)\n"
-                             "SQL: CREATE TABLE, INSERT, SELECT (WHERE/JOIN/ORDER BY/aggregates),\n"
+                             "SQL: CREATE TABLE, INSERT, SELECT (WHERE/JOIN),\n"
                              "     DELETE, EXPLAIN, BEGIN/COMMIT/ROLLBACK\n";
                 continue;
             }

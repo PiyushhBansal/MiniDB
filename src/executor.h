@@ -197,31 +197,4 @@ struct HashJoin : Operator {
     }
 };
 
-// ORDER BY. just buffers everything and stable_sorts it
-struct Sort : Operator {
-    unique_ptr<Operator> child;
-    int sort_col;
-    bool desc;
-    vector<Row> rows;
-    size_t cursor = 0;
-    Sort(unique_ptr<Operator> c, int col, bool d)
-        : child(move(c)), sort_col(col), desc(d) { out_schema = child->out_schema; }
-    void open() override {
-        child->open();
-        Row r;
-        while (child->next(r)) rows.push_back(r);
-        child->close();
-        stable_sort(rows.begin(), rows.end(), [&](const Row& a, const Row& b) {
-            int c = a.values[sort_col].compare(b.values[sort_col]);
-            return desc ? c > 0 : c < 0;
-        });
-        cursor = 0;
-    }
-    bool next(Row& out) override {
-        if (cursor >= rows.size()) return false;
-        out = rows[cursor++];
-        return true;
-    }
-};
-
 }  // namespace minidb

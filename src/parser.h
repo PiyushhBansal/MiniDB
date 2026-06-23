@@ -152,21 +152,10 @@ private:
         Statement st; st.kind = Statement::SELECT;
         auto& sel = st.select;
         expect_kw("SELECT");
-        // aggregate? COUNT(*) / SUM(col) / MIN(col) / MAX(col)
-        string maybe_agg = upper(peek().text);
-        if ((maybe_agg == "COUNT" || maybe_agg == "SUM" || maybe_agg == "MIN" || maybe_agg == "MAX")
-            && peek(1).type == Token::PUNCT && peek(1).text == "(") {
-            next(); expect_punct("(");
-            sel.agg = maybe_agg == "COUNT" ? AggFn::COUNT : maybe_agg == "SUM" ? AggFn::SUM
-                      : maybe_agg == "MIN" ? AggFn::MIN : AggFn::MAX;
-            sel.agg_column = next().text;   // '*' ends up here for COUNT(*)
-            expect_punct(")");
-        } else {
-            while (true) {
-                sel.columns.push_back(next().text);
-                if (accept_punct(",")) continue;
-                break;
-            }
+        while (true) {
+            sel.columns.push_back(next().text);
+            if (accept_punct(",")) continue;
+            break;
         }
         expect_kw("FROM");
         sel.table = next().text;
@@ -181,13 +170,6 @@ private:
             sel.join_right_col = right;
         }
         if (accept_kw("WHERE")) parse_where(sel.where);
-        if (accept_kw("ORDER")) {
-            expect_kw("BY");
-            sel.has_order = true;
-            sel.order_column = next().text;
-            if (accept_kw("DESC")) sel.order_desc = true;
-            else accept_kw("ASC");
-        }
         return st;
     }
 

@@ -307,15 +307,6 @@ private:
         } else if (!other_preds.empty()) {
             root = make_unique<Filter>(move(root), other_preds);
         }
-
-        if (s.has_order) {
-            int col = root->out_schema.index_of(s.order_column);
-            if (col < 0) {
-                auto d = s.order_column.find('.');
-                if (d != string::npos) col = root->out_schema.index_of(s.order_column.substr(d + 1));
-            }
-            if (col >= 0) root = make_unique<Sort>(move(root), col, s.order_desc);
-        }
         return root;
     }
 
@@ -325,37 +316,6 @@ private:
 
         ResultSet rs;
         const Schema& osch = root->out_schema;
-
-        // aggregate: drain all rows, emit one row
-        if (s.agg != AggFn::NONE) {
-            int col = s.agg_column == "*" ? -1 : osch.index_of(s.agg_column);
-            int64_t count = 0, sum = 0;
-            Value mn, mx; bool first = true;
-            Row r;
-            while (root->next(r)) {
-                count++;
-                if (col >= 0) {
-                    const Value& v = r.values[col];
-                    if (v.type == Type::INT) sum += v.i;
-                    if (first) { mn = mx = v; first = false; }
-                    else { if (v < mn) mn = v; if (mx < v) mx = v; }
-                }
-            }
-            root->close();
-            string label = s.agg == AggFn::COUNT ? "count" : s.agg == AggFn::SUM ? "sum"
-                                : s.agg == AggFn::MIN ? "min" : "max";
-            rs.columns = {label};
-            Value out;
-            switch (s.agg) {
-                case AggFn::COUNT: out = Value::Int(count); break;
-                case AggFn::SUM: out = Value::Int(sum); break;
-                case AggFn::MIN: out = first ? Value::Int(0) : mn; break;
-                case AggFn::MAX: out = first ? Value::Int(0) : mx; break;
-                default: break;
-            }
-            rs.rows.push_back({out});
-            return rs;
-        }
 
         // projection: which columns to emit
         vector<int> proj;

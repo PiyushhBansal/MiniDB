@@ -30,8 +30,8 @@ database internals rather than a thin wrapper over existing tooling.
 **Goals.**
 - A real on-disk **storage engine** (pages, buffer pool with LRU eviction, heap files).
 - A persistent **B+ tree** index used by query execution.
-- An end-to-end **SQL** path: parse → plan → execute for `SELECT` (with `WHERE`,
-  `JOIN`, `ORDER BY`, aggregates), `INSERT`, `DELETE`.
+- An end-to-end **SQL** path: parse → plan → execute for `SELECT` (with `WHERE`
+  and `JOIN`), `INSERT`, `DELETE`.
 - A **cost-based optimizer** that chooses index vs sequential scan and join order.
 - **Serializable** transactions with strict **2PL** and deadlock detection.
 - **WAL** + **crash recovery** that preserves committed transactions.
@@ -66,9 +66,8 @@ heap-file storage. See [§9](#9-extension-track-c--lsm-tree) and
         │            ┌──────────▼──┐   ┌────────▼─────────┐
         │  optimizer │  Optimizer  │   │   Executor       │   executor.h
         │ (cost model│ access path │   │ Volcano operators│  SeqScan/IndexScan/
-        │  selectvty)│ join order  │   │ Filter/HashJoin/ │  LsmScan/Sort
-        │            └─────────────┘   │ Sort, aggregates │
-        │                              └───┬─────────┬────┘
+        │  selectvty)│ join order  │   │ Filter/HashJoin/ │  LsmScan/Filter
+        │            └─────────────┘   │ scan/join/filter │
         │   ┌──────────────┐  ┌────────────▼───┐ ┌───▼──────────────┐
         │   │ LockManager  │  │   B+ Tree      │ │   LSM-tree       │  bplus_tree.h
         │   │ strict 2PL   │  │   (PK index)   │ │ MemTable+SSTable │  lsm_tree.h
@@ -103,7 +102,7 @@ heap-file storage. See [§9](#9-extension-track-c--lsm-tree) and
 | `catalog.h` | data dictionary (tables, schemas, roots, storage kind) |
 | `parser.h`, `ast.h` | SQL tokenizer + recursive-descent parser → AST |
 | `optimizer.h` | selectivity, cost model, access-path & join-order choice |
-| `executor.h` | Volcano operators (scan/filter/join/sort/aggregate) |
+| `executor.h` | Volcano operators (scan/filter/join) |
 | `lock_manager.h` | strict 2PL, S/X locks, wait-for-graph deadlock detection |
 | `wal.h` | write-ahead log records + base64 image encoding |
 | `recovery.h` | ARIES-style analysis / redo / undo |
@@ -181,9 +180,9 @@ produces a `Statement` AST (`ast.h`). Supported grammar:
 ```
 CREATE TABLE t (col TYPE, …, PRIMARY KEY (col)) [USING LSM|HEAP];
 INSERT INTO t VALUES (…), (…);
-SELECT a, b | * | COUNT(*) | SUM(c)|MIN(c)|MAX(c)
+SELECT a, b | *
        FROM t [JOIN u ON t.x = u.y]
-       [WHERE p AND p …] [ORDER BY c [DESC]];
+       [WHERE p AND p …];
 DELETE FROM t [WHERE …];
 EXPLAIN SELECT …;
 BEGIN; COMMIT; ROLLBACK;
@@ -203,8 +202,6 @@ access path and the join order.
 | `LsmScan` | merged ordered scan over an LSM table |
 | `Filter` | apply ANDed `WHERE` predicates |
 | `HashJoin` | inner equi-join; builds a hash table on the smaller side |
-| `Sort` | `ORDER BY` |
-| _(aggregate)_ | `COUNT/SUM/MIN/MAX` folded over the child stream |
 
 `EXPLAIN` prints the chosen plan (access path + join build side).
 
@@ -401,16 +398,15 @@ INSERT INTO dept VALUES (10,'Eng'),(20,'Sales');
 INSERT INTO emp  VALUES (1,'alice',10),(2,'bob',20),(3,'carol',10);
 
 SELECT emp.name, dept.dname FROM emp JOIN dept ON emp.dept = dept.id
-       WHERE emp.dept = 10 ORDER BY emp.name;
+       WHERE emp.dept = 10;
 
 EXPLAIN SELECT * FROM emp WHERE id = 2;     -- show the chosen plan
-SELECT COUNT(*) FROM emp;
 
 BEGIN; INSERT INTO emp VALUES (4,'dave',20); ROLLBACK;   -- rolled back
 
 CREATE TABLE kv (k INT, v VARCHAR, PRIMARY KEY (k)) USING LSM;  -- Track C
 INSERT INTO kv VALUES (5,'five'),(2,'two'),(9,'nine');
-SELECT * FROM kv;                            -- returns sorted: 2,5,9
+SELECT * FROM kv;                            -- LSM scan returns keys in order: 2,5,9
 ```
 
 Shell meta-commands: `\tables`, `\checkpoint`, `\crash` (simulate power loss),
