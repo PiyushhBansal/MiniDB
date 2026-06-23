@@ -16,6 +16,8 @@
 |-----------|-------------|--------------|
 | _<member 1>_ | _SCALERxxxxx_ | _xxx@scaler.com_ |
 | _<member 2>_ | _SCALERxxxxx_ | _xxx@scaler.com_ |
+| _<member 3>_ | _SCALERxxxxx_ | _xxx@scaler.com_ |
+| _<member 4>_ | _SCALERxxxxx_ | _xxx@scaler.com_ |
 
 > **Team name:** `Team_MiniDB` &nbsp;•&nbsp; **Extension track:** **B — Concurrency (MVCC)**
 > _(Fill in the member details above before submitting the PR.)_
