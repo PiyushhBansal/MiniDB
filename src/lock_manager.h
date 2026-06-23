@@ -3,6 +3,7 @@
 #pragma once
 
 #include "common.h"
+#include <algorithm>
 #include <map>
 #include <set>
 #include <unordered_map>

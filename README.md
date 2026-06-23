@@ -111,7 +111,7 @@ to that snapshot — so readers take no locks and never block writers. See
 | `executor.h` | Volcano operators (scan/filter/join) |
 | `lock_manager.h` | strict 2PL, S/X locks, wait-for-graph deadlock detection |
 | `wal.h` | write-ahead log records + base64 image encoding |
-| `recovery.h` | ARIES-style analysis / redo / undo |
+| `recovery.h` | ARIES-inspired analysis / redo / undo |
 | `mvcc.h` | **Track B** — `MvccManager`: txn states, snapshots, version visibility |
 | `database.h` | the glue: planning, DDL/DML, transactions, recovery |
 
@@ -216,7 +216,11 @@ access path and the join order.
 
 ## 6. Optimizer
 
-A System-R-style **cost-based** optimizer (`optimizer.h`):
+A System-R-style **cost-based** optimizer (`optimizer.h`). Scope: per-table
+**access-path selection** (index vs sequential scan) and **two-table join
+ordering** (which side to build the hash table on). It does *not* do
+N-table join enumeration (Selinger-style dynamic programming) or histograms —
+selectivities use the textbook System-R constants below.
 
 - **Selectivity estimation.** Equality on a unique PK → ≈ `1/row_count` (one
   row); range predicates → the textbook `1/3`; `≠` → `1 − 1/n`. Conjunctions
@@ -279,12 +283,17 @@ pages are **not** forced (that is the whole point of WAL — turn random page
 flushes into one sequential log flush). Pages are written lazily; recovery
 replays anything that didn't make it.
 
-**Crash-recovery procedure** (`recovery.h`, ARIES-style, run at every startup):
+**Crash-recovery procedure** (`recovery.h`, ARIES-*inspired*, run at every startup):
 1. **Analysis** — scan the log to find which transactions committed.
 2. **Redo** — re-apply *all* logged changes in order (repeating history) to
    rebuild the page state at crash time.
 3. **Undo** — roll back the "loser" transactions (started, never committed) in
    reverse using before-images.
+
+> We follow ARIES's three-pass *repeating-history* structure, but keep it
+> simplified: redo is idempotent because records hold full physical before/after
+> images (rather than via per-page LSN comparison), and undo writes plain
+> before-images rather than ARIES Compensation Log Records (CLRs).
 
 Net guarantee: **committed transactions survive a crash; uncommitted ones
 vanish.** Demonstrable in the shell with `\crash` (exit without flushing pages):
