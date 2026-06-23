@@ -37,6 +37,9 @@ public:
         // recover before serving any query. redo committed + uncommitted, then undo the losers.
         Recovery rec(&wal_, &pool_);
         last_recovery_ = rec.recover();
+        // index pages aren't WAL'd, so the B+tree may be stale after recovery.
+        // rebuild each heap table's PK index from the now-correct heap.
+        rebuild_indexes();
     }
 
     BufferPool* pool() { return &pool_; }
@@ -147,6 +150,32 @@ public:
     }
 
 private:
+    // Rebuild each heap table's PK index from its recovered heap. The WAL logs
+    // heap slot changes but not index pages, so after a crash the B+tree can be
+    // out of sync with the heap. We build a fresh tree (old pages are leaked -
+    // MiniDB never reclaims pages anyway) and also recount live rows so the
+    // optimizer's cost model is accurate post-recovery. MVCC tables read via the
+    // snapshot scan, not the index, so they're skipped.
+    void rebuild_indexes() {
+        for (const string& name : catalog_.table_names()) {
+            TableInfo* t = catalog_.get(name);
+            if (!t || t->pk_col < 0 || t->storage == StorageKind::MVCC) continue;
+            BPlusTree tree(&pool_, BPlusTree::create(&pool_));
+            HeapFile hf(&pool_, t->heap_root);
+            int64_t live = 0;
+            hf.scan([&](RecordId rid, const string& rec) {
+                Tuple tup = deserialize_tuple(rec.data(), rec.size(), t->schema);
+                tree.insert(tup[t->pk_col].i, rid);
+                live++;
+                return true;
+            });
+            t->index_root = tree.root();
+            t->row_count = live;
+            catalog_.update(*t);
+        }
+        pool_.flush_all();
+    }
+
     ResultSet exec_create(const CreateStmt& c) {
         if (catalog_.has_table(c.table)) throw DBError("table already exists: " + c.table);
         TableInfo t;
@@ -180,6 +209,14 @@ private:
         for (const auto& row : ins.rows) {
             if (row.size() != t->schema.size())
                 throw DBError("column count mismatch on INSERT");
+            // PRIMARY KEY uniqueness. for heap tables the index tracks live keys
+            // exactly (DELETE erases the key), so a hit means a duplicate. MVCC
+            // keeps deleted versions in place, so we don't index-check those here.
+            if (t->pk_col >= 0 && !mvcc) {
+                BPlusTree idx(&pool_, t->index_root);
+                if (idx.search(row[t->pk_col].i))
+                    throw DBError("duplicate primary key: " + row[t->pk_col].to_string());
+            }
             // mvcc: stamp xmin = this txn, xmax = 0 (live). heap: plain bytes.
             string image = mvcc ? serialize_versioned(row, t->schema, scope.txn, 0)
                                 : serialize_tuple(row, t->schema);
